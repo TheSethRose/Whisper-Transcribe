@@ -1,0 +1,10 @@
+.venv/
+.whisperkit_cache/
+.env
+__pycache__/
+*.pyc
+transcriptions/
+# macOS system files
+.DS_Store
+.private/
+libs/

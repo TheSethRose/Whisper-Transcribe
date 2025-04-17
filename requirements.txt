@@ -1,0 +1,6 @@
+git+https://github.com/argmaxinc/whisperkittools.git
+ffmpeg-python
+nltk
+python-dotenv
+openai
+tqdm
