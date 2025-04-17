@@ -12,6 +12,7 @@ import datetime
 from functools import partial
 from tqdm import tqdm
 from dotenv import load_dotenv
+import time
 
 # Load environment variables from .env FIRST
 load_dotenv()
@@ -133,100 +134,95 @@ def load_config(args):
 def find_video_files(folder):
     return [f for f in Path(folder).iterdir() if f.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS and f.is_file()]
 
-def process_video(video_file, config):
-    """Worker function to process a single video file."""
-    output_folder = config['output_folder']
-    cli_path = config['cli_path']
-    models_dir = config['models_dir'] # Path determined by WhisperKit init
-    results_dir = config['results_dir'] # Path determined by WhisperKit init
-    add_timestamps = config['timestamps']
-    language = config['language']
-
-    out_txt = output_folder / (video_file.stem + '.txt')
-    result_json_path = results_dir / (video_file.stem + '.json')
-
+def process_video(video_file, config, worker_id, status_dict):
     try:
+        status_dict[worker_id] = f"{video_file.name}: 0% (Extracting audio)"
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = Path(tmpdir) / (video_file.stem + '.wav')
-
-            # 1. Extract Audio
             extract_audio_ffmpeg(video_file, audio_path)
 
-            # 2. Transcribe using WhisperKit CLI
+            status_dict[worker_id] = f"{video_file.name}: 0% (Transcribing)"
+            cli_path = config['cli_path']
+            models_dir = config['models_dir']
+            results_dir = config['results_dir']
+            add_timestamps = config['timestamps']
+            language = config['language']
             cmd = [
                 cli_path,
                 "transcribe",
                 "--audio-path", str(audio_path),
                 "--model-path", str(models_dir),
-                # Use defaults for compute units for now
                 "--text-decoder-compute-units", "cpuAndNeuralEngine",
                 "--audio-encoder-compute-units", "cpuAndNeuralEngine",
                 "--report-path", str(results_dir), "--report",
             ]
             if language:
-                # Assuming WhisperKit CLI uses --language
-                # Check `swift run whisperkit-cli transcribe --help` if needed
                 cmd.extend(["--language", language])
-
-            # If we want word timestamps in JSON, add flag here (but we format from segment times)
-            # cmd.append("--word-timestamps")
-
-            process = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            # Use Popen to capture real-time output
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+            try:
+                if process.stdout is None:
+                    process.kill()
+                    status_dict[worker_id] = f"Error: {video_file.name}"
+                    raise RuntimeError(f"whisperkit-cli failed to start for {video_file.name}: stdout is None")
+                for line in process.stdout:
+                    line = line.strip()
+                    if line.startswith("PROGRESS: "):
+                        try:
+                            percent = int(line.split(": ")[1])
+                            status_dict[worker_id] = f"{video_file.name}: {percent}% (Transcribing)"
+                        except Exception:
+                            pass
+                process.wait(timeout=600)
+            except Exception as e:
+                process.kill()
+                status_dict[worker_id] = f"Error: {video_file.name}"
+                raise RuntimeError(f"whisperkit-cli failed for {video_file.name}: {e}")
             if process.returncode != 0:
-                print(f"[ERROR] whisperkit-cli failed for {video_file.name}:\nSTDERR: {process.stderr.strip()}\nSTDOUT: {process.stdout.strip()}")
+                status_dict[worker_id] = f"Error: {video_file.name}"
                 raise RuntimeError(f"whisperkit-cli failed for {video_file.name}")
-
-            # 3. Read JSON result
+            result_json_path = results_dir / (video_file.stem + '.json')
             if not result_json_path.exists():
-                 raise RuntimeError(f"whisperkit-cli did not produce expected JSON report at {result_json_path}")
+                status_dict[worker_id] = f"Error: {video_file.name}"
+                raise RuntimeError(f"whisperkit-cli did not produce expected JSON report at {result_json_path}")
 
+            status_dict[worker_id] = f"{video_file.name}: 66% (Formatting output)"
             with open(result_json_path, "r", encoding='utf-8') as f:
                 results = json.load(f)
-
             if 'segments' not in results or not results['segments']:
-                print(f"[WARNING] No segments found in transcription for {video_file.name}")
-                transcript_text = results.get('text', '') # Use full text if no segments
+                transcript_text = results.get('text', '')
                 sentences = split_text_into_sentences(transcript_text)
                 formatted_lines = [s.strip() for s in sentences if s.strip()]
             else:
-                 # 4. Format Output
                 formatted_lines = []
                 for segment in results['segments']:
                     text = segment.get('text', '').strip()
-                    # Remove special tokens if present (may vary by model/version)
                     text = text.replace('<|startoftranscript|>', '').replace('<|endoftext|>', '')
                     text = text.replace('<|en|>', '').replace('<|transcribe|>', '').replace('<|nocaptions|>', '')
-                    # Remove timestamp tokens like <|0.00|>
                     text = subprocess.run(['sed', r's/<|\([0-9]*\.[0-9]*\)|>//g'], input=text, capture_output=True, text=True).stdout.strip()
-
                     if not text:
                         continue
-
                     sentences = split_text_into_sentences(text)
                     start_time_str = format_timestamp(segment.get('start', 0.0)) if add_timestamps else ""
-
                     for sentence in sentences:
                         clean_sentence = sentence.strip()
                         if clean_sentence:
-                             formatted_lines.append(f"{start_time_str} {clean_sentence}".strip())
-
-            # 5. Save Transcript
+                            formatted_lines.append(f"{start_time_str} {clean_sentence}".strip())
+            out_txt = config['output_folder'] / (video_file.stem + '.txt')
             with open(out_txt, 'w', encoding='utf-8') as f:
                 for line in formatted_lines:
                     f.write(line + '\n')
-
-        return None # Success
+        status_dict[worker_id] = f"{video_file.name}: 100% (Done)"
+        return None
     except Exception as e:
-        return (video_file.name, e) # Failure
+        status_dict[worker_id] = f"Error: {video_file.name}"
+        return (video_file.name, e)
 
 def main():
     args = parse_args()
     config = load_config(args)
-
-    # --- Initial Setup (Run once in main process) ---
     config['output_folder'].mkdir(parents=True, exist_ok=True)
     config['cache_dir'].mkdir(parents=True, exist_ok=True)
-
     print("\n========== WhisperKit Batch Video Transcription ==========")
     print(f"Input folder:      {config['input_folder']}")
     print(f"Output folder:     {config['output_folder']}")
@@ -236,68 +232,66 @@ def main():
     print(f"Timestamps:        {config['timestamps']}")
     print(f"Language:          {config['language'] if config['language'] else 'auto-detect'}")
     print("========================================================\n")
-
-    # Import WhisperKit only when needed
     try:
         from whisperkit.pipelines import WhisperKit
-        # Initialize WhisperKit primarily to ensure CLI is built and get paths
-        # This will clone/build/download models if not already cached
         pipe_init = WhisperKit(config['model_path'], out_dir=str(config['cache_dir']))
         config['cli_path'] = pipe_init.cli_path
         config['models_dir'] = pipe_init.models_dir
-        config['results_dir'] = pipe_init.results_dir # Where the CLI saves JSON reports
-        print("WhisperKit initialized.")
+        config['results_dir'] = Path(pipe_init.results_dir)
     except Exception as e:
         print(f"[FATAL] Error initializing WhisperKit: {e}")
         print("Please ensure WHISPERKIT_MODEL_PATH is correct and dependencies are installed.")
         sys.exit(1)
-
-    # --- Find and Filter Videos ---
     all_video_files = find_video_files(config['input_folder'])
     if not all_video_files:
         print("[INFO] No supported video files found in input folder.")
-        return # Changed from sys.exit(1)
-
+        return
     video_files_to_process = []
     if config['overwrite']:
         video_files_to_process = all_video_files
         print(f"[INFO] Found {len(all_video_files)} video(s). Overwriting enabled.")
     else:
-        print("[INFO] Checking for existing transcripts (overwrite disabled)...")
         for vf in all_video_files:
             out_txt = config['output_folder'] / (vf.stem + '.txt')
             if not out_txt.exists():
                 video_files_to_process.append(vf)
             else:
-                 print(f"  [SKIP] {vf.name} (transcript exists at {out_txt})")
+                print(f"  [SKIP] {vf.name} (transcript exists at {out_txt})")
         print(f"[INFO] Found {len(all_video_files)} total video(s). Processing {len(video_files_to_process)}.")
-
     if not video_files_to_process:
         print("[INFO] No videos to process. Exiting.")
         return
-
-    # --- Parallel Processing ---
     num_workers = config['num_workers']
     print(f"[INFO] Starting transcription with {num_workers} worker(s)...\n")
-
-    # Use functools.partial to pass the config to the worker
-    worker_func = partial(process_video, config=config)
-
-    errors = []
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        # Use imap_unordered for progress updates as tasks complete
-        results_iterator = pool.imap_unordered(worker_func, video_files_to_process)
-        for result in tqdm(results_iterator, total=len(video_files_to_process), desc="Transcribing", ncols=80):
-            if result is not None: # An error occurred
-                errors.append(result)
-
+    manager = multiprocessing.Manager()
+    status_dict = manager.dict({i: "Idle" for i in range(num_workers)})
+    errors = manager.list()
+    pool = multiprocessing.Pool(processes=num_workers)
+    results = []
+    for idx, video_file in enumerate(video_files_to_process):
+        worker_id = idx % num_workers
+        result = pool.apply_async(process_video, args=(video_file, config, worker_id, status_dict), callback=lambda r: errors.append(r) if r else None)
+        results.append(result)
+    completed = 0
+    total = len(video_files_to_process)
+    while completed < total:
+        os.system('clear' if os.name == 'posix' else 'cls')
+        print("Worker Status Table:")
+        print("====================")
+        for i in range(num_workers):
+            print(f"Worker {i+1}: {status_dict[i]}")
+        completed = sum(1 for r in results if r.ready())
+        print(f"\nProgress: {completed}/{total} videos processed.")
+        time.sleep(0.1)
+    pool.close()
+    pool.join()
     # --- Report Errors ---
-    if errors:
+    real_errors = [e for e in errors if e]
+    if real_errors:
         print("\n--- Errors Occurred ---")
-        for filename, error in errors:
+        for filename, error in real_errors:
             print(f"[ERROR] {filename}: {error}")
         print("-----------------------")
-
     print("\n[INFO] All done.\n")
 
 if __name__ == "__main__":
